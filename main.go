@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,15 +83,57 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.web)
 	mux.HandleFunc("/healthz", s.health)
 	mux.HandleFunc("/v1/models", s.models)
 	mux.HandleFunc("/v1/chat/completions", s.openAIChat)
 	mux.HandleFunc("/v1/messages", s.anthropicMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", s.countTokens)
+	mux.HandleFunc("/api/exec", s.exec)
 	log.Printf("workbuddy gateway listening on %s", cfg.Listen)
 	if err := http.ListenAndServe(cfg.Listen, s.authMiddleware(mux)); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func (s *server) web(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, webHTML)
+}
+
+func (s *server) exec(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var in struct {
+		Command string `json:"command"`
+	}
+	if err := decodeBody(r, &in); err != nil || strings.TrimSpace(in.Command) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "command is required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-lc", in.Command)
+	out, err := cmd.CombinedOutput()
+	result := map[string]any{"output": string(out), "exit_code": 0}
+	if err != nil {
+		result["exit_code"] = 1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			result["exit_code"] = exitErr.ExitCode()
+		}
+		if ctx.Err() != nil {
+			result["error"] = ctx.Err().Error()
+		}
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func login(cfg config) error {
@@ -660,3 +703,20 @@ func writeProtocolError(w http.ResponseWriter, status int, p protocol, msg strin
 		writeOpenAIError(w, status, "upstream_error", msg)
 	}
 }
+
+const webHTML = `<!doctype html>
+	<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+	<title>Raspberry Pi WorkBuddy</title>
+	<style>
+	body{margin:0;background:#111827;color:#e5e7eb;font:14px system-ui,sans-serif}main{display:grid;grid-template-columns:1fr 1fr;height:100vh;gap:1px;background:#374151}
+	section{background:#111827;display:flex;flex-direction:column;min-width:0}header{padding:14px 18px;font-weight:700;background:#1f2937}.log{flex:1;overflow:auto;padding:18px;white-space:pre-wrap}
+	.row{display:flex;gap:8px;padding:12px;background:#1f2937}textarea,input,button{font:inherit;border:1px solid #4b5563;border-radius:6px;background:#0f172a;color:#e5e7eb;padding:10px}textarea{flex:1;resize:vertical}button{cursor:pointer;background:#2563eb;border:0}button:hover{background:#1d4ed8}.msg{margin:0 0 12px}.user{color:#93c5fd}.assistant{color:#d1fae5}.system{color:#fbbf24}@media(max-width:800px){main{grid-template-columns:1fr;height:auto;min-height:100vh}section{min-height:50vh}}
+	</style></head><body><main>
+	<section><header>WorkBuddy 对话</header><div id="chat" class="log"></div><div class="row"><textarea id="prompt" rows="2" placeholder="输入问题..."></textarea><button onclick="chat()">发送</button></div></section>
+	<section><header>树莓派命令执行（高权限）</header><div id="term" class="log"></div><div class="row"><input id="command" placeholder="例如: vcgencmd measure_temp" style="flex:1"><button onclick="runCmd()">执行</button></div></section>
+	</main><script>
+	const key=prompt("请输入 WORKBUDDY_API_KEY"); const headers={"Authorization":"Bearer "+key,"Content-Type":"application/json"};
+	function add(id,who,text){const d=document.createElement("div");d.className="msg "+who;d.textContent=(who==="user"?"你: ":who==="assistant"?"AI: ":"系统: ")+text;document.getElementById(id).appendChild(d);document.getElementById(id).scrollTop=1e9}
+	async function chat(){const x=document.getElementById("prompt"),p=x.value.trim();if(!p)return;x.value="";add("chat","user",p);try{const r=await fetch("/v1/chat/completions",{method:"POST",headers,body:JSON.stringify({model:"glm-5.2",messages:[{role:"user",content:p}],stream:false})});const j=await r.json();add("chat","assistant",j.choices?.[0]?.message?.content||JSON.stringify(j))}catch(e){add("chat","system",String(e))}}
+	async function runCmd(){const x=document.getElementById("command"),c=x.value.trim();if(!c)return;if(!confirm("将以网关进程权限执行：\n\n"+c+"\n\n确定继续？"))return;x.value="";add("term","user","$ "+c);try{const r=await fetch("/api/exec",{method:"POST",headers,body:JSON.stringify({command:c})});const j=await r.json();add("term",j.exit_code===0?"assistant":"system",j.output||j.error||"(无输出)")}catch(e){add("term","system",String(e))}}
+	</script></body></html>`
