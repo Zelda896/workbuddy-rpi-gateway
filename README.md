@@ -6,6 +6,8 @@
 - `POST /v1/chat/completions`（OpenAI 兼容）
 - `POST /v1/messages`（Anthropic Messages 兼容）
 - `POST /v1/messages/count_tokens`（保守估算）
+- `GET /`：Tailscale 私网网页控制台（对话 + 明确确认后执行命令）
+- `POST /api/exec`：以网关进程权限执行 shell 命令，最长 2 分钟
 - SSE 流式转发、非流式聚合、401 自动刷新 token
 - `login` 命令：树莓派生成登录地址，浏览器完成登录后自动保存凭据
 
@@ -51,3 +53,15 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o wor
 ```
 
 OpenAI 客户端使用 `http://127.0.0.1:8080/v1`，Anthropic 客户端使用 `http://127.0.0.1:8080`。
+
+网页控制台访问（通过 Cloudflare Tunnel 路径路由）：
+
+```text
+https://pi.arcadia8086.com/ai/
+```
+
+页面会要求输入 `WORKBUDDY_API_KEY`。命令执行区域每次都会要求确认，并以运行网关的 Linux 用户权限执行。建议只监听 Tailscale 地址：
+
+网关程序仍只监听本机 `127.0.0.1:8080`，由 Tunnel 将 `/ai` 转发到它；Cockpit 的根路径不变。
+
+不要把此页面发布到公网；它具备远程命令执行能力。
