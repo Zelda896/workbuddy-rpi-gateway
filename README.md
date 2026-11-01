@@ -7,10 +7,21 @@
 - `POST /v1/messages`（Anthropic Messages 兼容）
 - `POST /v1/messages/count_tokens`（保守估算）
 - SSE 流式转发、非流式聚合、401 自动刷新 token
+- `login` 命令：树莓派生成登录地址，浏览器完成登录后自动保存凭据
 
 ## 配置
 
-复制 `config.example.env`，再加载环境变量。凭据可以使用 WorkBuddy/CLIProxyAPI 形状的 JSON：
+复制 `config.example.env`，再加载环境变量。推荐直接在树莓派执行登录，不需要从 Windows 复制加密凭据：
+
+```bash
+export WORKBUDDY_AUTH_FILE=$HOME/.config/workbuddy-gateway/auth.json
+mkdir -p "$(dirname "$WORKBUDDY_AUTH_FILE")"
+go run . login
+```
+
+程序会打印一个登录地址。用任意电脑或手机浏览器打开并完成 WorkBuddy 登录；登录成功后回到树莓派，凭据会自动保存。电脑/手机不需要持续运行。
+
+也可以手动使用 WorkBuddy/CLIProxyAPI 形状的 JSON：
 
 ```json
 {

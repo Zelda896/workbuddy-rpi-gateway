@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -22,9 +23,16 @@ import (
 const defaultListen = "127.0.0.1:8080"
 
 var (
+	upstreamBase = "https://copilot.tencent.com"
 	chatEndpoint = "https://copilot.tencent.com/v2/chat/completions"
 	refreshURL   = "https://copilot.tencent.com/v2/plugin/auth/token/refresh"
 )
+
+type apiEnvelope struct {
+	Code int             `json:"code"`
+	Msg  string          `json:"msg"`
+	Data json.RawMessage `json:"data"`
+}
 
 type storedAuth struct {
 	Auth struct {
@@ -62,10 +70,17 @@ type server struct {
 
 func main() {
 	cfg := loadConfig()
+	if len(os.Args) > 1 && os.Args[1] == "login" {
+		if err := login(cfg); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	s := &server{cfg: cfg, http: &http.Client{Timeout: 0}}
 	if err := s.loadAuth(); err != nil {
 		log.Printf("auth not loaded: %v", err)
 	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
 	mux.HandleFunc("/v1/models", s.models)
@@ -76,6 +91,87 @@ func main() {
 	if err := http.ListenAndServe(cfg.Listen, s.authMiddleware(mux)); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func login(cfg config) error {
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, upstreamBase+"/v2/plugin/auth/state?platform=CLI", strings.NewReader("{}"))
+	if err != nil {
+		return err
+	}
+	setCommonHeaders(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request login state: %w", err)
+	}
+	defer resp.Body.Close()
+	var env apiEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return fmt.Errorf("decode login state: %w", err)
+	}
+	var state struct {
+		State   string `json:"state"`
+		AuthURL string `json:"authUrl"`
+	}
+	if env.Code != 0 || json.Unmarshal(env.Data, &state) != nil || state.State == "" || state.AuthURL == "" {
+		return fmt.Errorf("login state rejected: %s", env.Msg)
+	}
+	fmt.Println("请在任意电脑或手机浏览器打开以下地址完成 WorkBuddy 登录：")
+	fmt.Println(state.AuthURL)
+	fmt.Println("登录完成后回到此处，程序会自动保存凭据。")
+	for i := 0; i < 120; i++ {
+		time.Sleep(3 * time.Second)
+		poll, err := http.NewRequest(http.MethodGet, upstreamBase+"/v2/plugin/auth/token?state="+url.QueryEscape(state.State), nil)
+		if err != nil {
+			return err
+		}
+		setCommonHeaders(poll)
+		pollResp, err := client.Do(poll)
+		if err != nil {
+			continue
+		}
+		var tokenEnv apiEnvelope
+		decodeErr := json.NewDecoder(pollResp.Body).Decode(&tokenEnv)
+		pollResp.Body.Close()
+		if decodeErr != nil || tokenEnv.Code != 0 {
+			fmt.Print(".")
+			continue
+		}
+		var token struct {
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresIn    int64  `json:"expiresIn"`
+			Domain       string `json:"domain"`
+		}
+		if json.Unmarshal(tokenEnv.Data, &token) != nil || token.AccessToken == "" {
+			fmt.Print(".")
+			continue
+		}
+		auth := storedAuth{}
+		auth.Auth.AccessToken = token.AccessToken
+		auth.Auth.RefreshToken = token.RefreshToken
+		auth.Auth.Domain = token.Domain
+		auth.Auth.ExpiresAt = time.Now().Add(time.Duration(token.ExpiresIn) * time.Second).Unix()
+		if cfg.AuthFile == "" {
+			return errors.New("WORKBUDDY_AUTH_FILE must be set for login")
+		}
+		raw, _ := json.MarshalIndent(auth, "", "  ")
+		if err := os.WriteFile(cfg.AuthFile, raw, 0600); err != nil {
+			return fmt.Errorf("save auth file: %w", err)
+		}
+		fmt.Printf("\n登录成功，凭据已保存到 %s\n", cfg.AuthFile)
+		return nil
+	}
+	return errors.New("login timed out after 6 minutes")
+}
+
+func setCommonHeaders(req *http.Request) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", "WorkBuddy/5.5.6 CLI/2.63.2")
+	req.Header.Set("Origin", "https://www.codebuddy.cn")
+	req.Header.Set("Referer", "https://www.codebuddy.cn/")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 }
 
 func loadConfig() config {
